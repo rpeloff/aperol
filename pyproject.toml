@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aperol"
+version = "0.0.0-a0"
+requires-python = ">=3.10"
+dependencies = ["pyyaml"]
+authors = [{name = "Ryan Eloff", email = "ryaneloff@gmail.com"}]
+description = "Aperol: A featherweight framework for configuration of Python objects"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+]
+keywords = ["aperol", "config", "configuration", "machine", "learning"]
+
+[project.urls]
+Homepage = "https://github.com/rpeloff/aperol"
+Repository = "https://github.com/rpeloff/aperol.git"
+
+[tool.ruff]
+exclude = [
+    ".git",
+    "build",
+    "__pycache__",
+]
+line-length = 100
+indent-width = 4
+target-version = "py310"

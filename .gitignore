@@ -1,0 +1,16 @@
+# pyenv
+.python-version
+
+# mypy
+.mypy_cache/
+
+# pytest
+.pytest_cache/
+
+# byte compiled
+__pycache__/
+
+# build artifacts
+/*.egg-info
+build/
+dist/
