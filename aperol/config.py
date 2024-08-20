@@ -46,16 +46,19 @@ def _check_valid_config_tree(node_config: Any, node_key: str = "", node_path: st
         )
 
 
-def _check_search_pkgs(search_pkgs: SearchPkgs) -> None:
+def _check_and_format_search_pkgs(search_pkgs: SearchPkgs) -> SearchPkgs:
+    search_pkgs_canonical: list[str | tuple[str, str]] = []
     for pkg_name in search_pkgs:
         if isinstance(pkg_name, str):
-            continue
-        if (pkg_name_alias := tuple(pkg_name)) and len(pkg_name_alias) == 2:
-            continue
-        raise ValueError(
-            "Expected package import specified as a string or tuple of strings (name, alias). "
-            f"Got package = {pkg_name_alias}."
-        )
+            search_pkgs_canonical.append(pkg_name)
+        elif (pkg_name_alias := tuple(pkg_name)) and len(pkg_name_alias) == 2:
+            search_pkgs_canonical.append(pkg_name_alias)
+        else:
+            raise ValueError(
+                "Expected package import specified as a string or tuple of strings (name, alias). "
+                f"Got package = {pkg_name}."
+            )
+    return search_pkgs_canonical
 
 
 def _validate_config(
@@ -74,7 +77,7 @@ def _validate_config(
     if imports:
         if not isinstance(imports, Sequence):
             raise ValueError(f"Expected sequence for key 'imports'. Got type = {type(imports)}.")
-        _check_search_pkgs(imports)
+        imports = _check_and_format_search_pkgs(imports)
     return imports
 
 
@@ -250,7 +253,7 @@ def _parse_root_config_maybe_init(
 
 
 def register_imports(imports: SearchPkgs) -> None:
-    _check_search_pkgs(imports)
+    imports = _check_and_format_search_pkgs(imports)
     _REGISTERED_SEARCH_PKGS.extend(imports)
 
 
