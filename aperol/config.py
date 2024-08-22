@@ -1,6 +1,7 @@
 """Config parser."""
 
 import dataclasses
+import functools
 import importlib
 import importlib.resources
 import importlib.util
@@ -62,13 +63,13 @@ def _check_and_format_search_pkgs(search_pkgs: SearchPkgs) -> SearchPkgs:
 
 
 def _validate_config(
-    config: Any, path: str, required_keys: Sequence[str] | None = None
+    config: Any, paths: str | Sequence[str], required_keys: Sequence[str] | None = None
 ) -> SearchPkgs:
     required_keys = required_keys or []
     for key in required_keys:
         if key not in config:
             raise ValueError(
-                f"Could not parse config due to missing key '{key}'. Config path: {path}."
+                f"Could not parse config due to missing key '{key}'. Config path(s): {paths}."
             )
 
     _check_valid_config_tree(config)
@@ -276,35 +277,36 @@ def find_config(path: str, base_path: str | None = None) -> str:
     raise ValueError(f"Could not determine location of config '{path}'.")
 
 
-def load_config(path: str, base_path: str | None = None) -> tree_utils.DictTree:
-    config_path = find_config(path, base_path)
-    with open(config_path) as reader:
-        config = yaml.safe_load(reader)
+def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tree_utils.DictTree:
+    config_queue = []
+    if isinstance(paths, str):
+        config_path = find_config(paths, base_path)
+        with open(config_path) as reader:
+            config = yaml.safe_load(reader)
+            config_queue.append(config)
 
-    flat_config_stack = [tree_utils.flatten_dict_tree(config)]
+        extend_paths = config.get("extends", [])
+        extend_paths = [extend_paths] if isinstance(extend_paths, str) else extend_paths
 
-    extend_paths = config.get("extends", [])
-    extend_paths = [extend_paths] if isinstance(extend_paths, str) else extend_paths
-    extend_paths.reverse()
+        for extend_path in extend_paths:
+            base_config = load_config(extend_path, config_path)
+            config_queue.append(base_config)
+    else:
+        for path in paths:
+            config = load_config(path, base_path)
+            config_queue.append(config)
 
-    for extend_path in extend_paths:
-        base_config = load_config(extend_path, config_path)
-        flat_config_stack.append(tree_utils.flatten_dict_tree(base_config))
-
-    flat_config = flat_config_stack.pop()
-    while flat_config_stack:
-        flat_config = flat_config | flat_config_stack.pop()
-
-    return tree_utils.unflatten_dict_tree(flat_config)
+    # each successive config takes precedence over prior configs
+    return functools.reduce(tree_utils.merge_trees, config_queue, {})
 
 
 def parse_config(
-    path: str,
+    paths: str | Sequence[str],
     required_keys: Sequence[str] | None = None,
     search_pkgs: SearchPkgs | None = None,
 ) -> dict[str, Any]:
-    config = load_config(path)
-    config_search_pkgs = _validate_config(config, path, required_keys)
+    config = load_config(paths)
+    config_search_pkgs = _validate_config(config, paths, required_keys)
     config_extends = config.pop("extends", None)  # already parsed in `load_config`
 
     search_pkgs = list(search_pkgs or [])
