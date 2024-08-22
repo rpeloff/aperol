@@ -63,8 +63,13 @@ def _check_and_format_search_pkgs(search_pkgs: SearchPkgs) -> SearchPkgs:
 
 
 def _validate_config(
-    config: Any, paths: str | Sequence[str], required_keys: Sequence[str] | None = None
-) -> SearchPkgs:
+    config: Any,
+    paths: str | Sequence[str],
+    required_keys: Sequence[str] | None = None,
+) -> SearchPkgs | None:
+    if not isinstance(config, Mapping):
+        raise ValueError(f"Expected config to be mapping. Got config of type {type(config)}.")
+
     required_keys = required_keys or []
     for key in required_keys:
         if key not in config:
@@ -74,12 +79,11 @@ def _validate_config(
 
     _check_valid_config_tree(config)
 
-    imports = config.pop("imports", None)
-    if imports:
+    if imports := config.get("imports", None):
         if not isinstance(imports, Sequence):
             raise ValueError(f"Expected sequence for key 'imports'. Got type = {type(imports)}.")
-        imports = _check_and_format_search_pkgs(imports)
-    return imports
+        return _check_and_format_search_pkgs(imports)
+    return None
 
 
 def _find_obj_in_pkg(pkg_name: str, obj_type: str) -> Any | None:
@@ -211,46 +215,38 @@ def _parse_config_tree(
             return _maybe_resolve_float(node_config)
         return node_config
 
-    if "type" not in node_config:  # parse as normal mapping
-        configured_map = {}
-        for key, item_config in node_config.items():
-            parsed_config = _parse_config_tree(item_config, base_kwargs, search_pkgs)
-            configured_map[key] = parsed_config
-        return configured_map
-
-    # continue as python configurable defined by a (possibly nested) mapping
-    node_type = node_config["type"]
-    node_factory_or_value, node_init = _resolve_object(node_type, search_pkgs)
-
+    configured_map = {}
     # make shallow copy to avoid overwriting parent node's base kwargs by node-specific base kwargs
     node_base_kwargs = base_kwargs.copy()
 
-    # (1) take all non-mapping args, resolve objects and merge base arguments to propagate down
-    for child_key, child_type_or_config in node_config.items():
-        if isinstance(child_type_or_config, Mapping) or child_key == "type":
-            continue  # we will process mapping args in step (2) / node type object already resolved
+    # (1) take all non-mapping args and parse sub-trees
+    for key, item_config in node_config.items():
+        if isinstance(item_config, Mapping) or key == "type":
+            continue  # we will process mapping args or resolve node type object later
 
-        configured_child = _parse_config_tree(child_type_or_config, node_base_kwargs, search_pkgs)
-        node_base_kwargs.update({child_key: configured_child})
+        configured_item = _parse_config_tree(item_config, node_base_kwargs, search_pkgs)
 
-    # (2) iterate mapping by order, process each tree, resolve objects and append to base args
-    for child_key, child_config in node_config.items():
-        if not isinstance(child_config, Mapping):
+        configured_map[key] = configured_item
+        node_base_kwargs.update({key: configured_item})
+
+    # (2) iterate mapping by order and parse each sub-tree
+    for key, item_config in node_config.items():
+        if not isinstance(item_config, Mapping):
             continue  # already processed non-mapping args in step (1)
 
-        child_value = _parse_config_tree(child_config, node_base_kwargs, search_pkgs)
-        node_base_kwargs.update({child_key: child_value})
+        configured_item = _parse_config_tree(item_config, node_base_kwargs, search_pkgs)
 
-    return _maybe_create_delayed_constructor(node_factory_or_value, node_init, node_base_kwargs)
+        configured_map[key] = configured_item
+        node_base_kwargs.update({key: configured_item})
 
+    # (3) check if current tree defines a python configurable and resolve with node base kwargs
+    if "type" in node_config:
+        node_type = node_config["type"]
+        node_factory_or_value, node_init = _resolve_object(node_type, search_pkgs)
+        return _maybe_create_delayed_constructor(node_factory_or_value, node_init, node_base_kwargs)
 
-def _parse_root_config_maybe_init(
-    config: Any, base_kwargs: dict[str, Any], search_pkgs: SearchPkgs
-) -> Any:
-    configured = _parse_config_tree(config, base_kwargs, search_pkgs)
-    if isinstance(configured, _DelayedConstructor) and configured.init:
-        return configured()
-    return configured
+    # otherwise return the configured mapping
+    return configured_map
 
 
 def register_imports(imports: SearchPkgs) -> None:
@@ -283,6 +279,8 @@ def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tre
         config_path = find_config(paths, base_path)
         with open(config_path) as reader:
             config = yaml.safe_load(reader)
+            _validate_config(config, paths)
+
             config_queue.append(config)
 
         extend_paths = config.get("extends", [])
@@ -296,6 +294,11 @@ def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tre
             config = load_config(path, base_path)
             config_queue.append(config)
 
+    # unflatten inline trees x.y.z => {x: {y: {z: ...}}}
+    config_queue = list(
+        map(tree_utils.unflatten_dict_tree, map(tree_utils.flatten_dict_tree, config_queue))
+    )
+
     # each successive config takes precedence over prior configs
     return functools.reduce(tree_utils.merge_trees, config_queue, {})
 
@@ -304,19 +307,28 @@ def parse_config(
     paths: str | Sequence[str],
     required_keys: Sequence[str] | None = None,
     search_pkgs: SearchPkgs | None = None,
-) -> dict[str, Any]:
+    base_kwargs: dict[str, Any] | None = None,
+) -> tree_utils.DictTree:
     config = load_config(paths)
     config_search_pkgs = _validate_config(config, paths, required_keys)
+
     config_extends = config.pop("extends", None)  # already parsed in `load_config`
+    config.pop("imports", None)  # already parsed in `_validate_config`
 
     search_pkgs = list(search_pkgs or [])
     if config_search_pkgs is not None:
         search_pkgs.extend(config_search_pkgs)
     search_pkgs.extend(_REGISTERED_SEARCH_PKGS)
 
-    parsed_nodes: dict[str, Any] = {}
-    for node, node_config in config.items():
-        parsed_nodes[node] = _parse_root_config_maybe_init(node_config, parsed_nodes, search_pkgs)
+    parsed_nodes = _parse_config_tree(config, base_kwargs or {}, search_pkgs)
+
+    # call delayed constructor leaves with init specified by '()'
+    parsed_nodes = tree_utils.unflatten_dict_tree(
+        {
+            node: value() if isinstance(value, _DelayedConstructor) and value.init else value
+            for node, value in tree_utils.flatten_dict_tree(parsed_nodes).items()
+        }
+    )
 
     parsed_nodes["imports"] = search_pkgs
     parsed_nodes["extends"] = config_extends
