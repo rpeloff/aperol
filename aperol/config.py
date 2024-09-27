@@ -1,6 +1,5 @@
 """Config parser."""
 
-import dataclasses
 import functools
 import importlib
 import importlib.resources
@@ -15,6 +14,7 @@ from typing import Any, Union
 # TODO(rpeloff) support different config formats, e.g. YAML, JSON
 import yaml
 
+from aperol import clstools
 from aperol import tree_utils
 
 
@@ -141,51 +141,44 @@ def _resolve_object(obj_type: str, search_pkgs: SearchPkgs) -> tuple[Any, bool]:
     )
 
 
-def _resolve_partial_kwargs(obj: Any, base_args: dict[str, Any]) -> dict[str, Any]:
+def _resolve_partial_kwargs(
+    obj: Any, config_keys: Sequence[str], base_args: dict[str, Any]
+) -> dict[str, Any]:
     if not callable(obj):
         return {}
     obj_kwargs = {
         key: base_args[key] for key in inspect.signature(obj).parameters if key in base_args
     }
+    for k in config_keys:
+        if k not in obj_kwargs and k in base_args:
+            obj_kwargs[k] = base_args[k]
     return obj_kwargs
 
 
-@dataclasses.dataclass
-class _DelayedConstructor:
-    factory: Callable[..., Any]
-    init: bool
-    kwargs: dict[str, Any]
-
-    def __call__(self, *args, **kwargs: Any) -> Any:
-        kwargs = {**self.kwargs, **kwargs}
-        for k, v in kwargs.items():
-            if isinstance(v, _DelayedConstructor) and v.init:
-                kwargs[k] = v()
-            elif isinstance(v, Sequence) and not isinstance(v, str):
-                kwargs[k] = [
-                    value() if isinstance(value, _DelayedConstructor) and value.init else value
-                    for value in v
-                ]
-            elif isinstance(v, Mapping):
-                kwargs[k] = {
-                    key: value() if isinstance(value, _DelayedConstructor) and value.init else value
-                    for key, value in v.items()
-                }
-
-        return self.factory(*args, **kwargs)
-
-
-def _maybe_create_delayed_constructor(obj: Any, init: bool, base_kwargs: dict[str, Any]) -> Any:
-    if not callable(obj):
+def _maybe_apply_partial(
+    obj: Any, init: bool, config_keys: Sequence[str], base_kwargs: dict[str, Any]
+) -> Any:
+    if not callable(obj):  # obj is not a class or function
         if init:
-            raise ValueError(f"Object {type(obj)} is not callable.")
+            raise ValueError(
+                f"Object {obj} of type {type(obj)} is not a class or function but got init=True."
+            )
         return obj
 
-    obj_kwargs = _resolve_partial_kwargs(obj, base_kwargs)
+    obj_kwargs = _resolve_partial_kwargs(obj, config_keys, base_kwargs)
     if not obj_kwargs:
-        return obj  # return object as is if there are no arguments to pass
+        # return object (with optional call) if no arguments for partial application
+        return obj() if init else obj
 
-    return _DelayedConstructor(factory=obj, init=init, kwargs=obj_kwargs)
+    wrapped_obj: type | Callable[..., Any]
+    if isinstance(obj, type):  # obj is a class
+        wrapped_obj = clstools.partial_cls(obj, **obj_kwargs)
+    else:  # obj is a function
+        wrapped_obj = functools.partial(obj, **obj_kwargs)
+
+    if init:
+        return wrapped_obj()
+    return wrapped_obj
 
 
 def _maybe_resolve_float(value: str) -> str | float:
@@ -195,20 +188,40 @@ def _maybe_resolve_float(value: str) -> str | float:
         return value
 
 
+def _resolve_macro(macro_config: str, macros: dict[str, Any], node_path: str) -> Any:
+    macro_key = macro_config[1:]
+    if macro_key[0] == "(" and macro_key[-1] == ")":  # eval basic expression with globals=macros
+        expr = macro_key[1:-1]
+        return eval(expr, macros)
+    if macro_key == "required":
+        raise ValueError(f"Missing configuration for key '{node_path}' which is set to $required.")
+    if macro_key not in macros:
+        raise ValueError(f"Macro ${macro_key} not yet defined.")
+    macro_value = macros[macro_key]
+    return macro_value
+
+
 def _parse_config_tree(
-    node_config: Any, base_kwargs: dict[str, Any], search_pkgs: SearchPkgs
+    node_config: Any,
+    kwargs: dict[str, Any],
+    macros: dict[str, Any],
+    search_pkgs: SearchPkgs,
+    node_path: str | None = None,
 ) -> Any:
     if isinstance(node_config, Sequence) and not isinstance(node_config, str):
         configured_list = []
-        for item_config in node_config:
-            parsed_config = _parse_config_tree(item_config, base_kwargs, search_pkgs)
-            configured_list.append(parsed_config)
+        for index, item_config in enumerate(node_config):
+            item_path = ".".join((node_path, str(index))) if node_path else str(index)
+            configured_item = _parse_config_tree(
+                item_config, kwargs, macros, search_pkgs, node_path=item_path
+            )
+
+            configured_list.append(configured_item)
+            macros[item_path] = configured_item
         return configured_list
 
     if isinstance(node_config, str) and node_config.startswith("$"):
-        if (macro_key := node_config[1:]) in base_kwargs:
-            return base_kwargs[macro_key]
-        raise ValueError(f"Macro {node_config} not yet defined.")
+        return _resolve_macro(node_config, macros, node_path or "")
 
     if not isinstance(node_config, Mapping):
         if isinstance(node_config, str):
@@ -216,34 +229,45 @@ def _parse_config_tree(
         return node_config
 
     configured_map = {}
-    # make shallow copy to avoid overwriting parent node's base kwargs by node-specific base kwargs
-    node_base_kwargs = base_kwargs.copy()
+    # make shallow copy to avoid overwriting parent node's kwargs by node-specific kwargs
+    node_kwargs = kwargs.copy()
 
     # (1) take all non-mapping args and parse sub-trees
     for key, item_config in node_config.items():
         if isinstance(item_config, Mapping) or key == "type":
             continue  # we will process mapping args or resolve node type object later
 
-        configured_item = _parse_config_tree(item_config, node_base_kwargs, search_pkgs)
+        item_path = ".".join((node_path, key)) if node_path else key
+        configured_item = _parse_config_tree(
+            item_config, node_kwargs, macros, search_pkgs, node_path=item_path
+        )
 
         configured_map[key] = configured_item
-        node_base_kwargs.update({key: configured_item})
+        node_kwargs[key] = configured_item
+        macros[item_path] = configured_item
 
     # (2) iterate mapping by order and parse each sub-tree
     for key, item_config in node_config.items():
         if not isinstance(item_config, Mapping):
             continue  # already processed non-mapping args in step (1)
 
-        configured_item = _parse_config_tree(item_config, node_base_kwargs, search_pkgs)
+        item_path = ".".join((node_path, key)) if node_path else key
+        configured_item = _parse_config_tree(
+            item_config, node_kwargs, macros, search_pkgs, node_path=item_path
+        )
 
         configured_map[key] = configured_item
-        node_base_kwargs.update({key: configured_item})
+        node_kwargs[key] = configured_item
+        macros[item_path] = configured_item
 
     # (3) check if current tree defines a python configurable and resolve with node base kwargs
     if "type" in node_config:
         node_type = node_config["type"]
         node_factory_or_value, node_init = _resolve_object(node_type, search_pkgs)
-        return _maybe_create_delayed_constructor(node_factory_or_value, node_init, node_base_kwargs)
+
+        node_config_keys = list(node_config)
+        node_config_keys.remove("type")
+        return _maybe_apply_partial(node_factory_or_value, node_init, node_config_keys, node_kwargs)
 
     # otherwise return the configured mapping
     return configured_map
@@ -281,14 +305,13 @@ def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tre
             config = yaml.safe_load(reader)
             _validate_config(config, paths)
 
-            config_queue.append(config)
-
         extend_paths = config.get("extends", [])
         extend_paths = [extend_paths] if isinstance(extend_paths, str) else extend_paths
 
         for extend_path in extend_paths:
             base_config = load_config(extend_path, config_path)
             config_queue.append(base_config)
+        config_queue.append(config)
     else:
         for path in paths:
             config = load_config(path, base_path)
@@ -307,8 +330,9 @@ def parse_config(
     paths: str | Sequence[str],
     required_keys: Sequence[str] | None = None,
     search_pkgs: SearchPkgs | None = None,
-    base_kwargs: dict[str, Any] | None = None,
-) -> tree_utils.DictTree:
+    return_raw_config: bool = False,
+    **kwargs: Any,
+) -> tree_utils.DictTree | tuple[tree_utils.DictTree, tree_utils.DictTree]:
     config = load_config(paths)
     config_search_pkgs = _validate_config(config, paths, required_keys)
 
@@ -320,17 +344,57 @@ def parse_config(
         search_pkgs.extend(config_search_pkgs)
     search_pkgs.extend(_REGISTERED_SEARCH_PKGS)
 
-    parsed_nodes = _parse_config_tree(config, base_kwargs or {}, search_pkgs)
+    parsed_nodes = _parse_config_tree(config, kwargs or {}, {}, search_pkgs)
 
-    # call delayed constructor leaves with init specified by '()'
-    parsed_nodes = tree_utils.unflatten_dict_tree(
-        {
-            node: value() if isinstance(value, _DelayedConstructor) and value.init else value
-            for node, value in tree_utils.flatten_dict_tree(parsed_nodes).items()
-        }
-    )
-
-    parsed_nodes["imports"] = search_pkgs
-    parsed_nodes["extends"] = config_extends
+    if return_raw_config:
+        config["imports"] = search_pkgs
+        config["extends"] = config_extends
+        return parsed_nodes, config
 
     return parsed_nodes
+
+
+def config_str(config: tree_utils.DictTree) -> str:
+    print_config = config.copy()
+    extends = print_config.pop("extends", [])
+    imports = print_config.pop("imports", [])
+
+    out_str = ""
+    if extends:
+        out_str += f"# Extends:\n# {''.ljust(79, '=')}\n"
+        out_str += "\n".join(f"- {path}" for path in extends)
+        out_str += "\n\n"
+
+    if imports:
+        out_str += f"# Search packages:\n# {''.ljust(79, '=')}\n"
+        out_str += "\n".join(
+            sorted(
+                f"- {module[0]} (alias {module[1]})" if isinstance(module, tuple) else f"- {module}"
+                for module in imports
+            )
+        )
+        out_str += "\n\n"
+
+    # first print macros / simple objects
+    macros_strings = []
+    for k, v in print_config.items():
+        if isinstance(v, Mapping):
+            continue
+        macros_strings.append(f"{k} = {v!r}")
+
+    if macros_strings:
+        out_str += f"# Configuration:\n# {''.ljust(79, '=')}\n"
+        out_str += "\n".join(sorted(macros_strings))
+        out_str += "\n\n"
+
+    # next print each sub-tree flattened
+    for key, item_config in print_config.items():
+        if not isinstance(item_config, Mapping):
+            continue
+
+        out_str += f"# Configuration for {key}:\n# {''.ljust(79, '=')}\n"
+        for k, v in tree_utils.flatten_dict_tree(item_config).items():
+            out_str += f"{key}.{k} = {v!r}\n"
+        out_str += "\n"
+
+    return out_str
