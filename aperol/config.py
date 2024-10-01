@@ -181,10 +181,10 @@ def _maybe_apply_partial(
     return wrapped_obj
 
 
-def _maybe_resolve_float(value: str) -> str | float:
+def _maybe_resolve_object(value: str) -> Any:
     try:
-        return float(value)
-    except ValueError:
+        return eval(value)
+    except NameError:
         return value
 
 
@@ -225,7 +225,7 @@ def _parse_config_tree(
 
     if not isinstance(node_config, Mapping):
         if isinstance(node_config, str):
-            return _maybe_resolve_float(node_config)
+            return _maybe_resolve_object(node_config)
         return node_config
 
     configured_map = {}
@@ -334,6 +334,10 @@ def parse_config(
     **kwargs: Any,
 ) -> tree_utils.DictTree | tuple[tree_utils.DictTree, tree_utils.DictTree]:
     config = load_config(paths)
+
+    # config overrides passed as keyword arguments
+    config = tree_utils.merge_trees(config, tree_utils.unflatten_dict_tree(kwargs))
+
     config_search_pkgs = _validate_config(config, paths, required_keys)
 
     config_extends = config.pop("extends", None)  # already parsed in `load_config`
@@ -344,7 +348,7 @@ def parse_config(
         search_pkgs.extend(config_search_pkgs)
     search_pkgs.extend(_REGISTERED_SEARCH_PKGS)
 
-    parsed_nodes = _parse_config_tree(config, kwargs or {}, {}, search_pkgs)
+    parsed_nodes = _parse_config_tree(config, {}, {}, search_pkgs)
 
     if return_raw_config:
         config["imports"] = search_pkgs
