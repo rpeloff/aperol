@@ -184,7 +184,7 @@ def _maybe_apply_partial(
 def _maybe_resolve_object(value: str) -> Any:
     try:
         return eval(value)
-    except NameError:
+    except (NameError, SyntaxError):
         return value
 
 
