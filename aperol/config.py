@@ -297,7 +297,9 @@ def find_config(path: str, base_path: str | None = None) -> str:
     raise ValueError(f"Could not determine location of config '{path}'.")
 
 
-def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tree_utils.DictTree:
+def load_config(
+    paths: str | Sequence[str], base_path: str | None = None, **kwargs: Any
+) -> tree_utils.DictTree:
     config_queue = []
     if isinstance(paths, str):
         config_path = find_config(paths, base_path)
@@ -323,7 +325,12 @@ def load_config(paths: str | Sequence[str], base_path: str | None = None) -> tre
     )
 
     # each successive config takes precedence over prior configs
-    return functools.reduce(tree_utils.merge_trees, config_queue, {})
+    aggregate_config: tree_utils.DictTree = functools.reduce(
+        tree_utils.merge_trees, config_queue, {}
+    )
+
+    # config overrides passed as keyword arguments
+    return tree_utils.merge_trees(aggregate_config, tree_utils.unflatten_dict_tree(kwargs))
 
 
 def parse_config(
@@ -333,72 +340,70 @@ def parse_config(
     return_raw_config: bool = False,
     **kwargs: Any,
 ) -> tree_utils.DictTree | tuple[tree_utils.DictTree, tree_utils.DictTree]:
-    config = load_config(paths)
+    raw_config = load_config(paths, **kwargs)
+    config_search_pkgs = _validate_config(raw_config, paths, required_keys)
 
-    # config overrides passed as keyword arguments
-    config = tree_utils.merge_trees(config, tree_utils.unflatten_dict_tree(kwargs))
-
-    config_search_pkgs = _validate_config(config, paths, required_keys)
-
-    config_extends = config.pop("extends", None)  # already parsed in `load_config`
-    config.pop("imports", None)  # already parsed in `_validate_config`
+    config_extends = raw_config.pop("extends", None)  # already parsed in `load_config`
+    raw_config.pop("imports", None)  # already parsed in `_validate_config`
 
     search_pkgs = list(search_pkgs or [])
     if config_search_pkgs is not None:
         search_pkgs.extend(config_search_pkgs)
     search_pkgs.extend(_REGISTERED_SEARCH_PKGS)
 
-    parsed_nodes = _parse_config_tree(config, {}, {}, search_pkgs)
+    parsed_nodes = _parse_config_tree(raw_config, {}, {}, search_pkgs)
 
     if return_raw_config:
-        config["imports"] = search_pkgs
-        config["extends"] = config_extends
-        return parsed_nodes, config
+        raw_config["imports"] = search_pkgs
+        raw_config["extends"] = config_extends
+        return parsed_nodes, raw_config
 
     return parsed_nodes
 
 
-def config_str(config: tree_utils.DictTree) -> str:
-    print_config = config.copy()
-    extends = print_config.pop("extends", [])
-    imports = print_config.pop("imports", [])
+def dump_config(raw_config: tree_utils.DictTree) -> str:
+    config_copy = raw_config.copy()
+    extends = config_copy.pop("extends", None)
+    imports = config_copy.pop("imports", None)
 
-    out_str = ""
+    config_str = ""
     if extends:
-        out_str += f"# Extends:\n# {''.ljust(79, '=')}\n"
-        out_str += "\n".join(f"- {path}" for path in extends)
-        out_str += "\n\n"
+        config_str += f"# Extends:\n# {''.ljust(79, '=')}\n"
+        config_str += yaml.safe_dump({"extends": extends}, default_flow_style=None)
+        config_str += "\n"
 
     if imports:
-        out_str += f"# Search packages:\n# {''.ljust(79, '=')}\n"
-        out_str += "\n".join(
-            sorted(
-                f"- {module[0]} (alias {module[1]})" if isinstance(module, tuple) else f"- {module}"
-                for module in imports
-            )
-        )
-        out_str += "\n\n"
+        config_str += f"# Search packages:\n# {''.ljust(79, '=')}\n"
+        config_str += yaml.safe_dump({"imports": imports}, default_flow_style=None)
+        config_str += "\n"
 
-    # first print macros / simple objects
-    macros_strings = []
-    for k, v in print_config.items():
-        if isinstance(v, Mapping):
-            continue
-        macros_strings.append(f"{k} = {v!r}")
+    # separate macros / simple objects from tree configs
+    simple_config = {}
+    tree_keys = []
+    for k, v in config_copy.items():
+        # if type(v).__module__ != "builtins":
+        if isinstance(v, Mapping) and "type" in v:
+            if len(v) == 1:
+                simple_config[f"{k}.type"] = v["type"]
+            else:
+                tree_keys.append(k)
+        else:
+            simple_config[k] = v
 
-    if macros_strings:
-        out_str += f"# Configuration:\n# {''.ljust(79, '=')}\n"
-        out_str += "\n".join(sorted(macros_strings))
-        out_str += "\n\n"
+    # first dump macros / simple objects
+    if simple_config:
+        config_str += f"# Configuration:\n# {''.ljust(79, '=')}\n"
+        config_str += yaml.safe_dump(simple_config, default_flow_style=None)
+        config_str += "\n"
 
-    # next print each sub-tree flattened
-    for key, item_config in print_config.items():
-        if not isinstance(item_config, Mapping):
-            continue
+    # dump each tree config
+    for key in sorted(tree_keys):
+        item_config = config_copy[key].copy()
+        item_type = item_config.pop("type")
+        item_config = {"type": item_type, **{k: item_config[k] for k in sorted(item_config)}}
 
-        out_str += f"# Configuration for {key}:\n# {''.ljust(79, '=')}\n"
-        for k, v in tree_utils.flatten_dict_tree(item_config).items():
-            out_str += f"{key}.{k} = {v!r}\n"
-        out_str += "\n"
+        config_str += f"# Configuration for {key}:\n# {''.ljust(79, '=')}\n"
+        config_str += yaml.safe_dump({key: item_config}, sort_keys=False, default_flow_style=None)
+        config_str += "\n"
 
-    return out_str
+    return config_str.strip()
