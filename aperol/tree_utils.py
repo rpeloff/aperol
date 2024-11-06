@@ -2,6 +2,7 @@
 
 from collections.abc import Mapping
 from typing import Any, TypeVar, Union
+import warnings
 
 V = TypeVar("V")
 MappingTree = Mapping[Any, Union[V, "MappingTree[V]"]]
@@ -30,8 +31,21 @@ def unflatten_dict_tree(flat: Mapping[str, V], separator: str = ".") -> DictTree
         key, *sub_keys = key.split(separator, maxsplit=1)
 
         if sub_keys:
+            # check that existing key's value is a dict-tree
+            # otherwise raise warning and the sub-key(s) which cannot be flattened
+            if key in tree and (
+                not isinstance(tree[key], dict) or not tree[key].get("__dict_tree__", False)
+            ):
+                key_path = separator.join([key] + sub_keys)
+                warnings.warn(
+                    f"Could not unflatten path '{key_path}' "
+                    f"since path '{key}' already contains value {tree[key]}"
+                )
+                continue
+
             if key not in tree:
-                tree[key] = {}
+                tree[key] = {"__dict_tree__": True}
+
             tree[key][sub_keys[0]] = value
         else:
             tree[key] = value
@@ -39,6 +53,7 @@ def unflatten_dict_tree(flat: Mapping[str, V], separator: str = ".") -> DictTree
     return {
         key: unflatten_dict_tree(value, separator=separator) if isinstance(value, dict) else value
         for key, value in tree.items()
+        if key != "__dict_tree__"
     }
 
 
