@@ -301,23 +301,28 @@ def load_config(
     paths: str | Sequence[str], base_path: str | None = None, **kwargs: Any
 ) -> tree_utils.DictTree:
     config_queue = []
+    merged_imports: set[Any] = set()
     if isinstance(paths, str):
         config_path = find_config(paths, base_path)
         with open(config_path) as reader:
             config = yaml.safe_load(reader)
-            _validate_config(config, paths)
+            imports = _validate_config(config, paths)
+
+        merged_imports.update(imports or set())
 
         extend_paths = config.get("extends", [])
         extend_paths = [extend_paths] if isinstance(extend_paths, str) else extend_paths
 
         for extend_path in extend_paths:
-            base_config = load_config(extend_path, config_path)
+            base_config = load_config(extend_path, config_path, return_imports=True)
             config_queue.append(base_config)
+            merged_imports.update(base_config.get("imports", set()))
         config_queue.append(config)
     else:
         for path in paths:
-            config = load_config(path, base_path)
+            config = load_config(path, base_path, return_imports=True)
             config_queue.append(config)
+            merged_imports.update(config.get("imports", set()))
 
     # unflatten inline trees x.y.z => {x: {y: {z: ...}}}
     config_queue = list(
@@ -330,7 +335,17 @@ def load_config(
     )
 
     # config overrides passed as keyword arguments
-    return tree_utils.merge_trees(aggregate_config, tree_utils.unflatten_dict_tree(kwargs))
+    aggregate_config = tree_utils.merge_trees(
+        aggregate_config, tree_utils.unflatten_dict_tree(kwargs)
+    )
+    merged_imports.update(kwargs.get("imports", set()))
+
+    # add merged imports set sorted alphabetically and placing aliased imports last
+    aggregate_config["imports"] = sorted(
+        merged_imports, key=lambda k: f"_{k}" if isinstance(k, str) else k[0]
+    )
+
+    return aggregate_config
 
 
 def parse_config(
